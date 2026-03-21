@@ -6,7 +6,10 @@ library(foreach)
 # GRAPH (a)
 # =============================================================================
 
+# -----------------------------------------------------------------------------
 # Network structure
+# -----------------------------------------------------------------------------
+
 create_network_structure_a <- function(N = 20) {
   n_groups   <- N / 4
   group_size <- 4
@@ -24,8 +27,10 @@ create_network_structure_a <- function(N = 20) {
               N = N, n_groups = n_groups, group_size = group_size))
 }
 
+# -----------------------------------------------------------------------------
+# Helper functions (possible configurations)
+# -----------------------------------------------------------------------------
 
-# Helper functions: generates a matrix of all possible binary (0/1) combinations for a vector of length
 generate_binary_configs <- function(n) {
   configs <- matrix(0, 2^n, n)
   for (j in 1:n)
@@ -40,8 +45,10 @@ get_chain_neighbors_local <- function(i, group_size = 4) {
   return(neighbors)
 }
 
-
+# -----------------------------------------------------------------------------
 # Energy functions
+# -----------------------------------------------------------------------------
+
 calculate_group_energy_Y <- function(Y_vec, A_vec, L_vec, params, group_size = 4) {
   energy <- 0
   for (i in 1:group_size) {
@@ -92,8 +99,10 @@ calculate_group_energy_L <- function(L_vec, params_L, group_size = 4) {
   return(energy)
 }
 
-
+# -----------------------------------------------------------------------------
 # Conditional probability functions
+# -----------------------------------------------------------------------------
+
 prob_Y_given_rest <- function(i, Y, A, L, params, network) {
   gs      <- network$group_size
   g       <- ceiling(i / gs)
@@ -136,9 +145,11 @@ prob_L_given_rest <- function(i, L, params_L, network) {
   return(exp(e1 - me) / (exp(e0 - me) + exp(e1 - me)))
 }
 
-
+# -----------------------------------------------------------------------------
 # Analytical estimands
 # ATE(alpha) = DE(alpha) + IE(alpha) = psi_1 - psi_0_0
+# -----------------------------------------------------------------------------
+
 calculate_psi_analytical_group <- function(i, a_vec, params, params_L, group_size = 4) {
   L_cfg <- generate_binary_configs(group_size)
   Y_cfg <- generate_binary_configs(group_size)
@@ -196,8 +207,10 @@ calculate_estimands_analytical <- function(network, params, params_A, params_L) 
               pi_A = pi_A))
 }
 
-
+# -----------------------------------------------------------------------------
 # Gibbs samplers
+# -----------------------------------------------------------------------------
+
 gibbs_sampler_observational <- function(network, params, params_A, params_L,
                                         n_iter = 5000, burn_in = 1000) {
   N <- network$N
@@ -233,8 +246,10 @@ gibbs_sampler_interventional <- function(a_vec, network, params, params_L,
   return(list(L_samples = Ls, Y_samples = Ys))
 }
 
-
+# -----------------------------------------------------------------------------
 # Single simulation run — returns DE, IE, ATE
+# -----------------------------------------------------------------------------
+
 run_single_simulation_a <- function(sim_id, network, params, params_A, params_L,
                                     n_iter, burn_in, n_alloc, seed = NULL) {
   if (!is.null(seed)) set.seed(seed + sim_id)
@@ -266,6 +281,7 @@ run_single_simulation_a <- function(sim_id, network, params, params_A, params_L,
 # -----------------------------------------------------------------------------
 # Main parallel simulation — graph (a)
 # -----------------------------------------------------------------------------
+
 run_simulation_a_parallel <- function(
     n_sim = 500, N = 20,
     params   = list(beta0=-1, beta1=0.5, beta2=0.3, beta3=0.4, beta4=0.2, theta=0.3),
@@ -357,7 +373,10 @@ run_simulation_a_parallel <- function(
 # GRAPH (b)
 # =============================================================================
 
+# -----------------------------------------------------------------------------
 # Network structure
+# -----------------------------------------------------------------------------
+
 create_network_structure_b <- function(N = 20) {
   n_groups <- N / 4; group_size <- 4
   G_interference <- matrix(0, N, N); G_dependence <- matrix(0, N, N)
@@ -382,8 +401,10 @@ get_pair_neighbors_local <- function(i, group_size = 4) {
 get_interference_neighbors <- function(i, G) which(G[i, ] == 1)
 get_dependence_neighbors   <- function(i, G) which(G[i, ] == 1)
 
+# -----------------------------------------------------------------------------
+# Energy functions
+# -----------------------------------------------------------------------------
 
-# Energy Function
 calculate_group_energy_Y_b <- function(Y_vec, A_vec, L_vec, params, group_size = 4) {
   energy <- 0
   for (i in 1:group_size) {
@@ -428,9 +449,11 @@ calculate_group_energy_L_b <- function(L_vec, params_L, group_size = 4) {
   return(energy)
 }
 
-
+# -----------------------------------------------------------------------------
 # Conditional probability functions
-local_energy_Y <- function(i, y_i, Y, A, L, params, network) {
+# -----------------------------------------------------------------------------
+
+local_energy_Y_b <- function(i, y_i, Y, A, L, params, network) {
   G_int <- network$G_interference; G_dep <- network$G_dependence
   int_nb <- get_interference_neighbors(i, G_int)
   dep_nb <- get_dependence_neighbors(i, G_dep)
@@ -443,7 +466,7 @@ local_energy_Y <- function(i, y_i, Y, A, L, params, network) {
   return(energy)
 }
 
-local_energy_A <- function(i, a_i, A, L, params_A, network) {
+local_energy_A_b <- function(i, a_i, A, L, params_A, network) {
   G_int <- network$G_interference; G_dep <- network$G_dependence
   int_nb <- get_interference_neighbors(i, G_int)
   dep_nb <- get_dependence_neighbors(i, G_dep)
@@ -453,33 +476,35 @@ local_energy_A <- function(i, a_i, A, L, params_A, network) {
   return(energy)
 }
 
-local_energy_L <- function(i, l_i, L, params_L, network) {
+local_energy_L_b <- function(i, l_i, L, params_L, network) {
   dep_nb <- get_dependence_neighbors(i, network$G_dependence)
   energy <- l_i * params_L$alpha
   if (length(dep_nb) > 0) energy <- energy + sum(l_i * L[dep_nb] * (1/length(dep_nb)) * params_L$omega)
   return(energy)
 }
 
-prob_Y_given_rest <- function(i, Y, A, L, params, network) {
-  e1 <- local_energy_Y(i, 1, replace(Y, i, 1), A, L, params, network)
-  e0 <- local_energy_Y(i, 0, replace(Y, i, 0), A, L, params, network)
+prob_Y_given_rest_b <- function(i, Y, A, L, params, network) {
+  e1 <- local_energy_Y_b(i, 1, replace(Y, i, 1), A, L, params, network)
+  e0 <- local_energy_Y_b(i, 0, replace(Y, i, 0), A, L, params, network)
   me <- max(e0, e1); exp(e1-me) / (exp(e0-me) + exp(e1-me))
 }
 
-prob_A_given_rest <- function(i, A, L, params_A, network) {
-  e1 <- local_energy_A(i, 1, replace(A, i, 1), L, params_A, network)
-  e0 <- local_energy_A(i, 0, replace(A, i, 0), L, params_A, network)
+prob_A_given_rest_b <- function(i, A, L, params_A, network) {
+  e1 <- local_energy_A_b(i, 1, replace(A, i, 1), L, params_A, network)
+  e0 <- local_energy_A_b(i, 0, replace(A, i, 0), L, params_A, network)
   me <- max(e0, e1); exp(e1-me) / (exp(e0-me) + exp(e1-me))
 }
 
-prob_L_given_rest <- function(i, L, params_L, network) {
-  e1 <- local_energy_L(i, 1, replace(L, i, 1), params_L, network)
-  e0 <- local_energy_L(i, 0, replace(L, i, 0), params_L, network)
+prob_L_given_rest_b <- function(i, L, params_L, network) {
+  e1 <- local_energy_L_b(i, 1, replace(L, i, 1), params_L, network)
+  e0 <- local_energy_L_b(i, 0, replace(L, i, 0), params_L, network)
   me <- max(e0, e1); exp(e1-me) / (exp(e0-me) + exp(e1-me))
 }
 
-
+# -----------------------------------------------------------------------------
 # Analytical estimands — graph (b)
+# -----------------------------------------------------------------------------
+
 calculate_psi_analytical_group_b <- function(i, a_vec, params, params_L, group_size = 4) {
   L_cfg <- generate_binary_configs(group_size)
   Y_cfg <- generate_binary_configs(group_size)
@@ -535,8 +560,10 @@ calculate_estimands_analytical_b <- function(network, params, params_A, params_L
               psi_1_group=psi_1, psi_0_group=psi_0, psi_0_0_group=psi_0_0, pi_A=pi_A))
 }
 
-
+# -----------------------------------------------------------------------------
 # Gibbs samplers — graph (b)
+# -----------------------------------------------------------------------------
+
 gibbs_sampler_observational_b <- function(network, params, params_A, params_L,
                                           n_iter=5000, burn_in=1000) {
   N <- network$N
@@ -545,9 +572,9 @@ gibbs_sampler_observational_b <- function(network, params, params_A, params_L,
   Ls <- matrix(0,n_s,N); As <- matrix(0,n_s,N); Ys <- matrix(0,n_s,N); si <- 1
   for (m in 1:n_iter) {
     for (i in sample(1:N)) {
-      L[i] <- rbinom(1,1,prob_L_given_rest(i,L,params_L,network))
-      A[i] <- rbinom(1,1,prob_A_given_rest(i,A,L,params_A,network))
-      Y[i] <- rbinom(1,1,prob_Y_given_rest(i,Y,A,L,params,network))
+      L[i] <- rbinom(1,1,prob_L_given_rest_b(i,L,params_L,network))
+      A[i] <- rbinom(1,1,prob_A_given_rest_b(i,A,L,params_A,network))
+      Y[i] <- rbinom(1,1,prob_Y_given_rest_b(i,Y,A,L,params,network))
     }
     if (m > burn_in) { Ls[si,]<-L; As[si,]<-A; Ys[si,]<-Y; si<-si+1 }
   }
@@ -562,16 +589,18 @@ gibbs_sampler_interventional_b <- function(a_vec, network, params, params_L,
   Ls <- matrix(0,n_s,N); Ys <- matrix(0,n_s,N); si <- 1
   for (m in 1:n_iter) {
     for (i in sample(1:N)) {
-      L[i] <- rbinom(1,1,prob_L_given_rest(i,L,params_L,network))
-      Y[i] <- rbinom(1,1,prob_Y_given_rest(i,Y,a_vec,L,params,network))
+      L[i] <- rbinom(1,1,prob_L_given_rest_b(i,L,params_L,network))
+      Y[i] <- rbinom(1,1,prob_Y_given_rest_b(i,Y,a_vec,L,params,network))
     }
     if (m > burn_in) { Ls[si,]<-L; Ys[si,]<-Y; si<-si+1 }
   }
   return(list(L_samples=Ls, Y_samples=Ys))
 }
 
-
+# -----------------------------------------------------------------------------
 # Single simulation run — graph (b), returns DE, IE, ATE
+# -----------------------------------------------------------------------------
+
 run_single_simulation_b <- function(sim_id, network, params, params_A, params_L,
                                     n_iter, burn_in, n_alloc, seed=NULL) {
   if (!is.null(seed)) set.seed(seed + sim_id)
@@ -599,8 +628,10 @@ run_single_simulation_b <- function(sim_id, network, params, params_A, params_L,
   return(list(DE=DE, IE=IE, ATE=ATE))
 }
 
-
+# -----------------------------------------------------------------------------
 # Main parallel simulation — graph (b)
+# -----------------------------------------------------------------------------
+
 run_simulation_b_parallel <- function(
     n_sim=500, N=20,
     params   = list(beta0=-1, beta1=0.5, beta2=0.3, beta3=0.4, beta4=0.2, theta=0.3),
@@ -631,8 +662,8 @@ run_simulation_b_parallel <- function(
     "create_network_structure_b", "generate_binary_configs",
     "get_pair_neighbors_local", "get_interference_neighbors", "get_dependence_neighbors",
     "calculate_group_energy_Y_b", "calculate_group_energy_A_b", "calculate_group_energy_L_b",
-    "local_energy_Y", "local_energy_A", "local_energy_L",
-    "prob_Y_given_rest", "prob_A_given_rest", "prob_L_given_rest",
+    "local_energy_Y_b", "local_energy_A_b", "local_energy_L_b",
+    "prob_Y_given_rest_b", "prob_A_given_rest_b", "prob_L_given_rest_b",
     "gibbs_sampler_observational_b", "gibbs_sampler_interventional_b",
     "run_single_simulation_b"), envir = environment())
   
@@ -682,11 +713,15 @@ run_simulation_b_parallel <- function(
   return(results)
 }
 
+
 # =============================================================================
 # GRAPH (c)
 # =============================================================================
 
+# -----------------------------------------------------------------------------
 # Network structure
+# -----------------------------------------------------------------------------
+
 create_network_structure_c <- function(N = 20) {
   n_groups <- N / 4; group_size <- 4
   G_interference <- matrix(0, N, N); G_dependence <- matrix(0, N, N)
@@ -718,8 +753,12 @@ get_dependence_neighbors_c <- function(i_local, group_size=4) {
   return(nb)
 }
 
-
+# -----------------------------------------------------------------------------
 # Energy functions — graph (c)
+# Ni ∩ g(i) = interference neighbors  →  beta3/beta4 and A-A psi terms
+# Ni         = dependence neighbors   →  theta Y-Y and L-L omega terms
+# -----------------------------------------------------------------------------
+
 calculate_group_energy_Y_c <- function(Y_vec, A_vec, L_vec, params, group_size=4) {
   energy <- 0
   for (i in 1:group_size) {
@@ -767,8 +806,10 @@ calculate_group_energy_L_c <- function(L_vec, params_L, group_size=4) {
   return(energy)
 }
 
-
+# -----------------------------------------------------------------------------
 # Conditional probability functions — graph (c)
+# -----------------------------------------------------------------------------
+
 prob_Y_given_rest_c <- function(i, Y, A, L, params, network) {
   gs <- network$group_size; g <- ceiling(i/gs); il <- i-(g-1)*gs
   idx <- ((g-1)*gs+1):(g*gs)
@@ -799,8 +840,10 @@ prob_L_given_rest_c <- function(i, L, params_L, network) {
   me <- max(e0,e1); exp(e1-me)/(exp(e0-me)+exp(e1-me))
 }
 
-
+# -----------------------------------------------------------------------------
 # Analytical estimands — graph (c)
+# -----------------------------------------------------------------------------
+
 calculate_psi_analytical_group_c <- function(i, a_vec, params, params_L, group_size=4) {
   L_cfg <- generate_binary_configs(group_size)
   Y_cfg <- generate_binary_configs(group_size)
@@ -856,8 +899,10 @@ calculate_estimands_analytical_c <- function(network, params, params_A, params_L
               psi_1_group=psi_1, psi_0_group=psi_0, psi_0_0_group=psi_0_0, pi_A=pi_A))
 }
 
-
+# -----------------------------------------------------------------------------
 # Gibbs samplers — graph (c)
+# -----------------------------------------------------------------------------
+
 gibbs_sampler_observational_c <- function(network, params, params_A, params_L,
                                           n_iter=5000, burn_in=1000) {
   N <- network$N
@@ -891,8 +936,10 @@ gibbs_sampler_interventional_c <- function(a_vec, network, params, params_L,
   return(list(L_samples=Ls, Y_samples=Ys))
 }
 
-
+# -----------------------------------------------------------------------------
 # Single simulation run — graph (c), returns DE, IE, ATE
+# -----------------------------------------------------------------------------
+
 run_single_simulation_c <- function(sim_id, network, params, params_A, params_L,
                                     n_iter, burn_in, n_alloc, seed=NULL) {
   if (!is.null(seed)) set.seed(seed+sim_id)
@@ -920,8 +967,10 @@ run_single_simulation_c <- function(sim_id, network, params, params_A, params_L,
   return(list(DE=DE, IE=IE, ATE=ATE))
 }
 
-
+# -----------------------------------------------------------------------------
 # Main parallel simulation — graph (c)
+# -----------------------------------------------------------------------------
+
 run_simulation_c_parallel <- function(
     n_sim=500, N=20,
     params   = list(beta0=-1, beta1=0.5, beta2=0.3, beta3=0.4, beta4=0.2, theta=0.3),
@@ -1025,3 +1074,4 @@ results_b <- run_simulation_b_parallel(
 results_c <- run_simulation_c_parallel(
   n_sim=500, N=20, params=params, params_A=params_A, params_L=params_L,
   n_iter=5000, burn_in=1000, n_alloc=50, n_cores=NULL, verbose=TRUE, seed=42)
+
