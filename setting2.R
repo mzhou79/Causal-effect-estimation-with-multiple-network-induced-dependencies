@@ -3,7 +3,7 @@ library(doParallel)
 library(foreach)
 
 # -----------------------------------------------------------------------------
-Group-level network structures (size = 4)
+# Group-level network structures (size = 4)
 # -----------------------------------------------------------------------------
 
 create_group_network_a_s2 <- function() {
@@ -33,7 +33,7 @@ create_group_network_c_s2 <- function() {
 }
 
 # -----------------------------------------------------------------------------
-Weighted energy functions (matching Setting 1)
+# Weighted energy functions (matching Setting 1)
 # Weights are 1/n_neighbors, consistent with Setting 1's energy functions.
 # This ensures the true estimands are identical between settings.
 # -----------------------------------------------------------------------------
@@ -167,7 +167,7 @@ calculate_true_estimands_s2 <- function(params, params_A, params_L) {
 }
 
 # -----------------------------------------------------------------------------
-Gibbs samplers at group level
+# Gibbs samplers at group level
 # -----------------------------------------------------------------------------
 
 # Observational sampler under true graph (c) — used to draw realistic A allocations
@@ -231,7 +231,7 @@ gibbs_intervene_group_s2 <- function(a_vec, params, params_L, network_fit,
 }
 
 # -----------------------------------------------------------------------------
-#Single simulation replicate
+# Single simulation replicate
 # -----------------------------------------------------------------------------
 
 run_single_replicate_s2 <- function(sim_id, network_fit,
