@@ -1,451 +1,625 @@
+# =============================================================================
+# Setting 2: Graph Misspecification Under True DGP (c)
+# =============================================================================
+#
+# PURPOSE
+# -------
+# This script evaluates how misspecifying the interference and/or dependence
+# graph affects estimation of causal estimands (Direct Effect, Indirect Effect,
+# and Average Total Effect) in a network setting with binary outcomes.
+#
+# DATA-GENERATING PROCESS (TRUE GRAPH = GRAPH c)
+# ----------------------------------------------
+#   - Interference graph : pairs  (1-2, 3-4) within each group of 4
+#   - Dependence graph   : chain  (1-2-3-4) within each group of 4
+#
+# THREE FITTED MODELS
+# -------------------
+#   Fit (a) : chain for BOTH interference and dependence   [misspecified]
+#   Fit (b) : pairs for BOTH interference and dependence   [misspecified]
+#   Fit (c) : pairs interference, chain dependence         [CORRECT]
+#
+# OUTPUT
+# ------
+# For each fit, we report mean, bias, empirical SE, RMSE, and coverage
+# (at the 95% level, using across-replicate SD) for DE, IE, and ATE.
+#
+# AUTHOR:  <your name>
+# DATE  :  <date>
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 0. Dependencies
+# -----------------------------------------------------------------------------
 library(parallel)
 library(doParallel)
 library(foreach)
 
+
 # -----------------------------------------------------------------------------
-# Group-level network structures (size = 4)
+# 1. Network constructors
+# -----------------------------------------------------------------------------
+# The population of N units is partitioned into N/4 disjoint groups of size 4.
+# The full N x N adjacency matrices are block-diagonal, with each 4 x 4 block
+# given by a "local" adjacency pattern (chain or pairs).
 # -----------------------------------------------------------------------------
 
-create_group_network_a_s2 <- function() {
+#' Build block-diagonal interference and dependence adjacency matrices.
+#'
+#' @param N            Total number of units (must be divisible by 4).
+#' @param G_int_local  4x4 local interference adjacency.
+#' @param G_dep_local  4x4 local dependence adjacency.
+#' @return A list with the full N x N matrices plus bookkeeping fields.
+build_network <- function(N, G_int_local, G_dep_local) {
+  stopifnot(N %% 4 == 0)
+  n_groups   <- N / 4
+  group_size <- 4
+  G_int <- matrix(0, N, N)
+  G_dep <- matrix(0, N, N)
+  for (g in 1:n_groups) {
+    idx <- ((g - 1) * group_size + 1):(g * group_size)
+    G_int[idx, idx] <- G_int_local
+    G_dep[idx, idx] <- G_dep_local
+  }
+  list(G_interference = G_int,
+       G_dependence   = G_dep,
+       N              = N,
+       n_groups       = n_groups,
+       group_size     = group_size)
+}
+
+#' Chain adjacency 1 - 2 - 3 - 4 (used for dependence in graph c; both in a).
+chain_local <- function() {
   G <- matrix(0, 4, 4)
-  # chain 1-2-3-4 for both interference and dependence
-  for (k in 1:3) { G[k, k+1] <- G[k+1, k] <- 1 }
-  list(G_interference = G, G_dependence = G, group_size = 4)
+  for (k in 1:3) G[k, k + 1] <- G[k + 1, k] <- 1
+  G
 }
 
-create_group_network_b_s2 <- function() {
+#' Pairs adjacency (1-2), (3-4) (used for interference in graph c; both in b).
+pairs_local <- function() {
   G <- matrix(0, 4, 4)
-  # pairs (1-2), (3-4) for both interference and dependence
-  G[1,2] <- G[2,1] <- 1
-  G[3,4] <- G[4,3] <- 1
-  list(G_interference = G, G_dependence = G, group_size = 4)
+  G[1, 2] <- G[2, 1] <- 1
+  G[3, 4] <- G[4, 3] <- 1
+  G
 }
 
-create_group_network_c_s2 <- function() {
-  G_int <- matrix(0, 4, 4)
-  G_dep <- matrix(0, 4, 4)
-  # interference: pairs only
-  G_int[1,2] <- G_int[2,1] <- 1
-  G_int[3,4] <- G_int[4,3] <- 1
-  # dependence: full chain
-  for (k in 1:3) { G_dep[k, k+1] <- G_dep[k+1, k] <- 1 }
-  list(G_interference = G_int, G_dependence = G_dep, group_size = 4)
-}
+# Convenience constructors for the three graph specifications.
+create_network_a <- function(N = 8) build_network(N, chain_local(), chain_local())
+create_network_b <- function(N = 8) build_network(N, pairs_local(), pairs_local())
+create_network_c <- function(N = 8) build_network(N, pairs_local(), chain_local())
+
 
 # -----------------------------------------------------------------------------
-# Weighted energy functions (matching Setting 1)
-# Weights are 1/n_neighbors, consistent with Setting 1's energy functions.
-# This ensures the true estimands are identical between settings.
+# 2. Utilities
 # -----------------------------------------------------------------------------
 
-calculate_energy_L_s2 <- function(L_vec, params_L, network) {
-  n      <- length(L_vec)
-  energy <- sum(L_vec) * params_L$alpha
-  for (i in 1:(n-1)) {
-    for (j in (i+1):n) {
-      if (network$G_dependence[i, j] == 1) {
-        # weighted: average of the two units' neighbor counts
-        n_i   <- sum(network$G_dependence[i, ])
-        n_j   <- sum(network$G_dependence[j, ])
-        w_ij  <- 0.5 * (1/n_i + 1/n_j)
-        energy <- energy + params_L$omega * w_ij * L_vec[i] * L_vec[j]
-      }
-    }
-  }
-  energy
+#' Enumerate all 2^n binary vectors as a 2^n x n matrix.
+generate_binary_configs <- function(n) {
+  configs <- matrix(0, 2^n, n)
+  for (j in 1:n)
+    configs[, j] <- rep(c(0, 1), each = 2^(n - j), times = 2^(j - 1))
+  configs
 }
 
-calculate_energy_A_s2 <- function(A_vec, L_vec, params_A, network) {
-  n      <- length(A_vec)
-  energy <- 0
-  for (i in 1:n) {
-    nb_int <- which(network$G_interference[i, ] == 1)
-    lp     <- params_A$gamma0 + params_A$gamma1 * L_vec[i]
-    if (length(nb_int) > 0)
-      lp <- lp + params_A$gamma2 * mean(L_vec[nb_int])   # mean = weighted by 1/n
-    energy <- energy + A_vec[i] * lp
-  }
-  for (i in 1:(n-1)) {
-    for (j in (i+1):n) {
-      if (network$G_dependence[i, j] == 1) {
-        n_i  <- sum(network$G_dependence[i, ])
-        n_j  <- sum(network$G_dependence[j, ])
-        w_ij <- 0.5 * (1/n_i + 1/n_j)
-        energy <- energy + params_A$psi * w_ij * A_vec[i] * A_vec[j]
-      }
-    }
-  }
-  energy
+#' Degree of node i in a 4x4 adjacency matrix, clamped to >= 1 so that
+#' reciprocal-degree weights never divide by zero.
+deg_local <- function(G_local, i) {
+  d <- sum(G_local[i, ])
+  if (d == 0) 1 else d
 }
 
-calculate_energy_Y_s2 <- function(Y_vec, A_vec, L_vec, params, network) {
-  n      <- length(Y_vec)
+
+# -----------------------------------------------------------------------------
+# 3. Group-level energy functions
+# -----------------------------------------------------------------------------
+# These define the joint distributions of (L, A, Y) within a single group of 4.
+#
+# Parameterization (matches Setting 1):
+#   - Directed contributions (neighbor covariates in L, A): mean() over
+#     interference neighbors.
+#   - Undirected contributions (Y-Y, A-A, L-L): symmetric weight
+#     w_avg = 0.5 * (1/deg_i + 1/deg_j).
+# -----------------------------------------------------------------------------
+
+#' Group energy for outcome Y given (A, L) within a group.
+group_energy_Y <- function(Y_vec, A_vec, L_vec, params,
+                           G_int_local, G_dep_local) {
   energy <- 0
-  for (i in 1:n) {
-    nb_int <- which(network$G_interference[i, ] == 1)
-    lp     <- params$beta0 + params$beta1 * A_vec[i] + params$beta2 * L_vec[i]
+  # Node-level linear predictor terms
+  for (i in 1:4) {
+    nb_int <- which(G_int_local[i, ] == 1)
+    lp <- params$beta0 + params$beta1 * A_vec[i] + params$beta2 * L_vec[i]
     if (length(nb_int) > 0) {
-      lp <- lp + params$beta3 * mean(A_vec[nb_int]) +
+      lp <- lp +
+        params$beta3 * mean(A_vec[nb_int]) +
         params$beta4 * mean(L_vec[nb_int])
     }
     energy <- energy + Y_vec[i] * lp
   }
-  for (i in 1:(n-1)) {
-    for (j in (i+1):n) {
-      if (network$G_dependence[i, j] == 1) {
-        n_i  <- sum(network$G_dependence[i, ])
-        n_j  <- sum(network$G_dependence[j, ])
-        w_ij <- 0.5 * (1/n_i + 1/n_j)
-        energy <- energy + params$theta * w_ij * Y_vec[i] * Y_vec[j]
+  # Pairwise Y-Y dependence terms
+  for (i in 1:3) {
+    for (j in (i + 1):4) {
+      if (G_dep_local[i, j] == 1) {
+        w_avg <- 0.5 * (1 / deg_local(G_dep_local, i) +
+                        1 / deg_local(G_dep_local, j))
+        energy <- energy + Y_vec[i] * Y_vec[j] * w_avg * params$theta
       }
     }
   }
   energy
 }
 
-# -----------------------------------------------------------------------------
-# Analytical truth under true model (c) - Same as Setting 1
-# -----------------------------------------------------------------------------
-
-calculate_true_estimands_s2 <- function(params, params_A, params_L) {
-  
-  network_true <- create_group_network_c_s2()
-  gs           <- 4
-  L_cfg        <- generate_binary_configs(gs)
-  A_cfg        <- generate_binary_configs(gs)
-  Y_cfg        <- generate_binary_configs(gs)
-  
-  # f(L)
-  fL_unnorm <- apply(L_cfg, 1, function(l)
-    exp(calculate_energy_L_s2(l, params_L, network_true)))
-  fL <- fL_unnorm / sum(fL_unnorm)
-  
-  # pi(a) = sum_l f(a|l) f(l)
-  pi_A <- rep(0, nrow(A_cfg))
-  for (li in 1:nrow(L_cfg)) {
-    fA_unnorm <- apply(A_cfg, 1, function(a)
-      exp(calculate_energy_A_s2(a, L_cfg[li,], params_A, network_true)))
-    pi_A <- pi_A + fL[li] * fA_unnorm / sum(fA_unnorm)
-  }
-  
-  # psi_i(a) = sum_l E[Yi | do(A=a), L=l] * f(l)
-  calc_psi <- function(a_vec) {
-    psi <- rep(0, gs)
-    for (li in 1:nrow(L_cfg)) {
-      fY_unnorm <- apply(Y_cfg, 1, function(y)
-        exp(calculate_energy_Y_s2(y, a_vec, L_cfg[li,], params, network_true)))
-      fY    <- fY_unnorm / sum(fY_unnorm)
-      EY    <- colSums(Y_cfg * fY)
-      psi   <- psi + fL[li] * EY
+#' Group energy for treatment A given L within a group.
+group_energy_A <- function(A_vec, L_vec, params_A,
+                           G_int_local, G_dep_local) {
+  energy <- 0
+  for (i in 1:4) {
+    nb_int <- which(G_int_local[i, ] == 1)
+    energy <- energy + A_vec[i] * (params_A$gamma0 + params_A$gamma1 * L_vec[i])
+    if (length(nb_int) > 0) {
+      energy <- energy + A_vec[i] * params_A$gamma2 * mean(L_vec[nb_int])
     }
-    psi
   }
-  
-  psi_1 <- psi_0 <- rep(0, gs)
-  for (i in 1:gs) {
-    idx1 <- which(A_cfg[, i] == 1); w1 <- pi_A[idx1] / sum(pi_A[idx1])
-    idx0 <- which(A_cfg[, i] == 0); w0 <- pi_A[idx0] / sum(pi_A[idx0])
-    tmp1 <- tmp0 <- rep(0, gs)
-    for (k in seq_along(idx1)) tmp1 <- tmp1 + w1[k] * calc_psi(A_cfg[idx1[k],])
-    for (k in seq_along(idx0)) tmp0 <- tmp0 + w0[k] * calc_psi(A_cfg[idx0[k],])
-    psi_1[i] <- tmp1[i]
-    psi_0[i] <- tmp0[i]
+  for (i in 1:3) {
+    for (j in (i + 1):4) {
+      if (G_dep_local[i, j] == 1) {
+        w_avg <- 0.5 * (1 / deg_local(G_dep_local, i) +
+                        1 / deg_local(G_dep_local, j))
+        energy <- energy + A_vec[i] * A_vec[j] * w_avg * params_A$psi
+      }
+    }
   }
-  psi_00 <- calc_psi(rep(0, gs))
-  
-  list(
-    DE      = mean(psi_1 - psi_0),
-    IE      = mean(psi_0 - psi_00),
-    ATE     = mean(psi_1 - psi_00),
-    DE_unit = psi_1 - psi_0,
-    IE_unit = psi_0 - psi_00,
-    psi_1   = psi_1,
-    psi_0   = psi_0,
-    psi_00  = psi_00
-  )
+  energy
 }
 
+#' Group energy for covariate L within a group.
+group_energy_L <- function(L_vec, params_L, G_dep_local) {
+  energy <- sum(L_vec) * params_L$alpha
+  for (i in 1:3) {
+    for (j in (i + 1):4) {
+      if (G_dep_local[i, j] == 1) {
+        w_avg <- 0.5 * (1 / deg_local(G_dep_local, i) +
+                        1 / deg_local(G_dep_local, j))
+        energy <- energy + L_vec[i] * L_vec[j] * w_avg * params_L$omega
+      }
+    }
+  }
+  energy
+}
+
+
 # -----------------------------------------------------------------------------
-# Gibbs samplers at group level
+# 4. Full conditional probabilities (for Gibbs sampling)
+# -----------------------------------------------------------------------------
+# Each full conditional P(X_i = 1 | rest) is obtained by computing the group
+# energy under X_i = 1 vs X_i = 0, then returning a numerically stable softmax.
 # -----------------------------------------------------------------------------
 
-# Observational sampler under true graph (c) — used to draw realistic A allocations
-gibbs_obs_group_c_s2 <- function(params, params_A, params_L,
-                                 n_iter = 4000, burn_in = 1000) {
-  net <- create_group_network_c_s2()
-  n   <- 4
-  L   <- rbinom(n, 1, 0.5); A <- rbinom(n, 1, 0.5); Y <- rbinom(n, 1, 0.5)
-  n_keep <- n_iter - burn_in
-  Ls <- matrix(0, n_keep, n); As <- matrix(0, n_keep, n); Ys <- matrix(0, n_keep, n)
-  ki <- 1
+#' P(Y_i = 1 | Y_{-i}, A, L).
+prob_Y_given_rest <- function(i, Y, A, L, params, network,
+                              G_int_local, G_dep_local) {
+  gs    <- network$group_size
+  g     <- ceiling(i / gs)
+  i_loc <- i - (g - 1) * gs
+  idx   <- ((g - 1) * gs + 1):(g * gs)
+  Yg <- Y[idx]; Ag <- A[idx]; Lg <- L[idx]
+  Y1 <- Yg; Y1[i_loc] <- 1
+  Y0 <- Yg; Y0[i_loc] <- 0
+  e1 <- group_energy_Y(Y1, Ag, Lg, params, G_int_local, G_dep_local)
+  e0 <- group_energy_Y(Y0, Ag, Lg, params, G_int_local, G_dep_local)
+  me <- max(e0, e1)                          # numerical stabilizer
+  exp(e1 - me) / (exp(e0 - me) + exp(e1 - me))
+}
+
+#' P(A_i = 1 | A_{-i}, L).
+prob_A_given_rest <- function(i, A, L, params_A, network,
+                              G_int_local, G_dep_local) {
+  gs    <- network$group_size
+  g     <- ceiling(i / gs)
+  i_loc <- i - (g - 1) * gs
+  idx   <- ((g - 1) * gs + 1):(g * gs)
+  Ag <- A[idx]; Lg <- L[idx]
+  A1 <- Ag; A1[i_loc] <- 1
+  A0 <- Ag; A0[i_loc] <- 0
+  e1 <- group_energy_A(A1, Lg, params_A, G_int_local, G_dep_local)
+  e0 <- group_energy_A(A0, Lg, params_A, G_int_local, G_dep_local)
+  me <- max(e0, e1)
+  exp(e1 - me) / (exp(e0 - me) + exp(e1 - me))
+}
+
+#' P(L_i = 1 | L_{-i}).
+prob_L_given_rest <- function(i, L, params_L, network, G_dep_local) {
+  gs    <- network$group_size
+  g     <- ceiling(i / gs)
+  i_loc <- i - (g - 1) * gs
+  idx   <- ((g - 1) * gs + 1):(g * gs)
+  Lg <- L[idx]
+  L1 <- Lg; L1[i_loc] <- 1
+  L0 <- Lg; L0[i_loc] <- 0
+  e1 <- group_energy_L(L1, params_L, G_dep_local)
+  e0 <- group_energy_L(L0, params_L, G_dep_local)
+  me <- max(e0, e1)
+  exp(e1 - me) / (exp(e0 - me) + exp(e1 - me))
+}
+
+
+# -----------------------------------------------------------------------------
+# 5. Analytical ground truth (under the TRUE graph c)
+# -----------------------------------------------------------------------------
+# Because each group has only 4 units, we can enumerate all 2^4 = 16 binary
+# configurations and compute the true DE, IE, and ATE in closed form.
+# -----------------------------------------------------------------------------
+
+#' Exact E[Y_i | do(A = a_vec)] by marginalizing L and Y analytically.
+psi_analytical_group <- function(i_loc, a_vec, params, params_L,
+                                 G_int_local, G_dep_local) {
+  L_cfg <- generate_binary_configs(4)
+  Y_cfg <- generate_binary_configs(4)
+  # Marginal distribution of L
+  fL <- exp(apply(L_cfg, 1, function(l)
+    group_energy_L(l, params_L, G_dep_local)))
+  fL <- fL / sum(fL)
+  # E[Y_i | A = a_vec, L = l] for each l
+  EYi <- sapply(1:nrow(L_cfg), function(li) {
+    fY <- exp(apply(Y_cfg, 1, function(y)
+      group_energy_Y(y, a_vec, L_cfg[li, ], params, G_int_local, G_dep_local)))
+    sum(Y_cfg[, i_loc] * fY / sum(fY))
+  })
+  sum(EYi * fL)
+}
+
+#' Exact P(A = A_vec | L = L_vec).
+prob_A_given_L_analytical <- function(A_vec, L_vec, params_A,
+                                      G_int_local, G_dep_local) {
+  A_cfg <- generate_binary_configs(4)
+  fA <- exp(apply(A_cfg, 1, function(a)
+    group_energy_A(a, L_vec, params_A, G_int_local, G_dep_local)))
+  a_idx <- which(apply(A_cfg, 1, function(x) all(x == A_vec)))
+  fA[a_idx] / sum(fA)
+}
+
+#' Marginal allocation probability pi(a) = P(A = a_vec) under the observational
+#' data-generating process.
+marginal_pi_A <- function(A_vec, params_A, params_L,
+                          G_int_local, G_dep_local) {
+  L_cfg <- generate_binary_configs(4)
+  fL <- exp(apply(L_cfg, 1, function(l)
+    group_energy_L(l, params_L, G_dep_local)))
+  fL <- fL / sum(fL)
+  sum(sapply(1:nrow(L_cfg), function(li)
+    prob_A_given_L_analytical(A_vec, L_cfg[li, ], params_A,
+                              G_int_local, G_dep_local) * fL[li]))
+}
+
+#' Compute the analytical (ground-truth) DE, IE, and ATE.
+calculate_estimands_analytical <- function(network, params, params_A, params_L,
+                                           G_int_local, G_dep_local) {
+  gs    <- network$group_size
+  A_cfg <- generate_binary_configs(gs)
+
+  cat("  Computing allocation probabilities pi(a)...\n")
+  pi_A <- sapply(1:nrow(A_cfg), function(k)
+    marginal_pi_A(A_cfg[k, ], params_A, params_L, G_int_local, G_dep_local))
+  cat("  Allocation probabilities sum to:", round(sum(pi_A), 6), "\n")
+
+  cat("  Computing analytical psi for each position...\n")
+  psi_1 <- psi_0 <- psi_0_0 <- numeric(gs)
+  for (i in 1:gs) {
+    cat("    Position", i, "\n")
+    # psi(1, i): average over allocations with A_i = 1
+    cfg1 <- which(A_cfg[, i] == 1); pi1 <- pi_A[cfg1] / sum(pi_A[cfg1])
+    psi_1[i] <- sum(pi1 * sapply(cfg1, function(k)
+      psi_analytical_group(i, A_cfg[k, ], params, params_L,
+                           G_int_local, G_dep_local)))
+    # psi(0, i): average over allocations with A_i = 0
+    cfg0 <- which(A_cfg[, i] == 0); pi0 <- pi_A[cfg0] / sum(pi_A[cfg0])
+    psi_0[i] <- sum(pi0 * sapply(cfg0, function(k)
+      psi_analytical_group(i, A_cfg[k, ], params, params_L,
+                           G_int_local, G_dep_local)))
+    # psi(0, 0): everyone untreated
+    psi_0_0[i] <- psi_analytical_group(i, rep(0, gs), params, params_L,
+                                       G_int_local, G_dep_local)
+  }
+
+  DE  <- mean(psi_1 - psi_0)      # Direct effect
+  IE  <- mean(psi_0 - psi_0_0)    # Indirect (spillover) effect
+  ATE <- mean(psi_1 - psi_0_0)    # Average total effect
+
+  list(DE = DE, IE = IE, ATE = ATE)
+}
+
+
+# -----------------------------------------------------------------------------
+# 6. Gibbs samplers
+# -----------------------------------------------------------------------------
+# Used for (i) generating observational data from which to draw allocations,
+# and (ii) simulating Y | do(A = a_vec) for a chosen allocation.
+# -----------------------------------------------------------------------------
+
+#' Observational Gibbs sampler for (L, A, Y).
+gibbs_sampler_observational <- function(network, params, params_A, params_L,
+                                        G_int_local, G_dep_local,
+                                        n_iter = 5000, burn_in = 1000) {
+  N <- network$N
+  L <- rbinom(N, 1, 0.5); A <- rbinom(N, 1, 0.5); Y <- rbinom(N, 1, 0.5)
+  n_s <- n_iter - burn_in
+  Ls <- matrix(0, n_s, N); As <- matrix(0, n_s, N); Ys <- matrix(0, n_s, N)
+  si <- 1
   for (m in 1:n_iter) {
-    for (i in sample(1:n)) {
-      L1 <- L; L1[i] <- 1; L0 <- L; L0[i] <- 0
-      e1 <- calculate_energy_L_s2(L1, params_L, net)
-      e0 <- calculate_energy_L_s2(L0, params_L, net)
-      me <- max(e0, e1)
-      L[i] <- rbinom(1, 1, exp(e1-me) / (exp(e0-me) + exp(e1-me)))
-      
-      A1 <- A; A1[i] <- 1; A0 <- A; A0[i] <- 0
-      e1 <- calculate_energy_A_s2(A1, L, params_A, net)
-      e0 <- calculate_energy_A_s2(A0, L, params_A, net)
-      me <- max(e0, e1)
-      A[i] <- rbinom(1, 1, exp(e1-me) / (exp(e0-me) + exp(e1-me)))
-      
-      Y1 <- Y; Y1[i] <- 1; Y0 <- Y; Y0[i] <- 0
-      e1 <- calculate_energy_Y_s2(Y1, A, L, params, net)
-      e0 <- calculate_energy_Y_s2(Y0, A, L, params, net)
-      me <- max(e0, e1)
-      Y[i] <- rbinom(1, 1, exp(e1-me) / (exp(e0-me) + exp(e1-me)))
+    for (i in sample(1:N)) {
+      L[i] <- rbinom(1, 1, prob_L_given_rest(i, L, params_L, network, G_dep_local))
+      A[i] <- rbinom(1, 1, prob_A_given_rest(i, A, L, params_A, network,
+                                             G_int_local, G_dep_local))
+      Y[i] <- rbinom(1, 1, prob_Y_given_rest(i, Y, A, L, params, network,
+                                             G_int_local, G_dep_local))
     }
-    if (m > burn_in) { Ls[ki,] <- L; As[ki,] <- A; Ys[ki,] <- Y; ki <- ki+1 }
+    if (m > burn_in) { Ls[si, ] <- L; As[si, ] <- A; Ys[si, ] <- Y; si <- si + 1 }
   }
   list(L_samples = Ls, A_samples = As, Y_samples = Ys)
 }
 
-# Interventional sampler under a fitted graph — A is fixed at a_vec
-gibbs_intervene_group_s2 <- function(a_vec, params, params_L, network_fit,
-                                     n_iter = 4000, burn_in = 1000) {
-  n   <- 4
-  L   <- rbinom(n, 1, 0.5); Y <- rbinom(n, 1, 0.5)
-  n_keep <- n_iter - burn_in
-  Ys  <- matrix(0, n_keep, n); ki <- 1
+#' Interventional Gibbs sampler for (L, Y) with A held fixed at a_vec.
+gibbs_sampler_interventional <- function(a_vec, network, params, params_L,
+                                         G_int_local, G_dep_local,
+                                         n_iter = 5000, burn_in = 1000) {
+  N <- network$N
+  L <- rbinom(N, 1, 0.5); Y <- rbinom(N, 1, 0.5)
+  n_s <- n_iter - burn_in
+  Ls <- matrix(0, n_s, N); Ys <- matrix(0, n_s, N)
+  si <- 1
   for (m in 1:n_iter) {
-    for (i in sample(1:n)) {
-      L1 <- L; L1[i] <- 1; L0 <- L; L0[i] <- 0
-      e1 <- calculate_energy_L_s2(L1, params_L, network_fit)
-      e0 <- calculate_energy_L_s2(L0, params_L, network_fit)
-      me <- max(e0, e1)
-      L[i] <- rbinom(1, 1, exp(e1-me) / (exp(e0-me) + exp(e1-me)))
-      
-      Y1 <- Y; Y1[i] <- 1; Y0 <- Y; Y0[i] <- 0
-      e1 <- calculate_energy_Y_s2(Y1, a_vec, L, params, network_fit)
-      e0 <- calculate_energy_Y_s2(Y0, a_vec, L, params, network_fit)
-      me <- max(e0, e1)
-      Y[i] <- rbinom(1, 1, exp(e1-me) / (exp(e0-me) + exp(e1-me)))
+    for (i in sample(1:N)) {
+      L[i] <- rbinom(1, 1, prob_L_given_rest(i, L, params_L, network, G_dep_local))
+      Y[i] <- rbinom(1, 1, prob_Y_given_rest(i, Y, a_vec, L, params, network,
+                                             G_int_local, G_dep_local))
     }
-    if (m > burn_in) { Ys[ki,] <- Y; ki <- ki+1 }
+    if (m > burn_in) { Ls[si, ] <- L; Ys[si, ] <- Y; si <- si + 1 }
   }
-  colMeans(Ys)
+  list(L_samples = Ls, Y_samples = Ys)
 }
 
-# -----------------------------------------------------------------------------
-# Single simulation replicate (for parallel workers)
-# -----------------------------------------------------------------------------
 
-run_single_replicate_s2 <- function(sim_id, network_fit,
-                                    params, params_A, params_L,
-                                    n_groups, n_alloc,
-                                    n_iter_intervene, burn_in_intervene,
-                                    seed = NULL) {
+# -----------------------------------------------------------------------------
+# 7. Single replicate
+# -----------------------------------------------------------------------------
+# Workflow for one Monte-Carlo replicate:
+#   (1) Draw n_alloc allocations a_vec from the TRUE-graph observational sampler.
+#   (2) For each of the three fitted graphs, estimate DE / IE / ATE using those
+#       same allocations (paired design -> reduced Monte Carlo variance).
+# -----------------------------------------------------------------------------
+run_single_replicate <- function(sim_id,
+                                 network, N,
+                                 G_int_true, G_dep_true,
+                                 G_int_a, G_dep_a,
+                                 G_int_b, G_dep_b,
+                                 G_int_c, G_dep_c,
+                                 params, params_A, params_L,
+                                 n_iter, burn_in, n_alloc,
+                                 seed = NULL) {
   if (!is.null(seed)) set.seed(seed + sim_id)
-  
-  # Draw observed A allocations from the TRUE graph (c)
-  A_obs <- array(0, dim = c(n_alloc, n_groups, 4))
-  for (g in 1:n_groups) {
-    obs  <- gibbs_obs_group_c_s2(params, params_A, params_L,
-                                 n_iter  = n_alloc * 60,
-                                 burn_in = 1000)
-    pick <- round(seq(1, nrow(obs$A_samples), length.out = n_alloc))
-    A_obs[, g, ] <- obs$A_samples[pick, ]
-  }
-  
-  # Estimate psi_i(1) and psi_i(0) by averaging over observed allocations,
-  # but computing E[Y | do(A = a_obs)] under the FITTED graph
-  N       <- n_groups * 4
-  psi_1   <- psi_0 <- cnt1 <- cnt0 <- numeric(N)
-  
-  for (k in 1:n_alloc) {
-    for (g in 1:n_groups) {
-      a_vec      <- A_obs[k, g, ]
-      EY         <- gibbs_intervene_group_s2(a_vec, params, params_L, network_fit,
-                                             n_iter_intervene, burn_in_intervene)
-      idx_global <- ((g - 1) * 4 + 1):(g * 4)
-      for (i in 1:4) {
+
+  # Step 1: draw allocations from the TRUE graph (c) observational sampler
+  obs <- gibbs_sampler_observational(network, params, params_A, params_L,
+                                     G_int_true, G_dep_true,
+                                     n_iter = n_alloc * 50, burn_in = 500)
+  aidx <- seq(1, nrow(obs$A_samples), length.out = n_alloc)
+
+  # Step 2: estimator for one fitted graph, sharing allocations across fits
+  estimate_one_fit <- function(G_int_fit, G_dep_fit) {
+    psi_1 <- psi_0 <- cnt1 <- cnt0 <- numeric(N)
+    for (k in 1:n_alloc) {
+      a_vec <- obs$A_samples[round(aidx[k]), ]
+      Ymeans <- colMeans(
+        gibbs_sampler_interventional(a_vec, network, params, params_L,
+                                     G_int_fit, G_dep_fit,
+                                     n_iter, burn_in)$Y_samples
+      )
+      for (i in 1:N) {
         if (a_vec[i] == 1) {
-          psi_1[idx_global[i]] <- psi_1[idx_global[i]] + EY[i]
-          cnt1[idx_global[i]]  <- cnt1[idx_global[i]]  + 1
+          psi_1[i] <- psi_1[i] + Ymeans[i]; cnt1[i] <- cnt1[i] + 1
         } else {
-          psi_0[idx_global[i]] <- psi_0[idx_global[i]] + EY[i]
-          cnt0[idx_global[i]]  <- cnt0[idx_global[i]]  + 1
+          psi_0[i] <- psi_0[i] + Ymeans[i]; cnt0[i] <- cnt0[i] + 1
         }
       }
     }
+    psi_1 <- psi_1 / pmax(cnt1, 1)
+    psi_0 <- psi_0 / pmax(cnt0, 1)
+    # All-control counterfactual
+    psi_0_0 <- colMeans(
+      gibbs_sampler_interventional(rep(0, N), network, params, params_L,
+                                   G_int_fit, G_dep_fit,
+                                   n_iter, burn_in)$Y_samples
+    )
+    c(DE  = mean(psi_1 - psi_0),
+      IE  = mean(psi_0 - psi_0_0),
+      ATE = mean(psi_1 - psi_0_0))
   }
-  
-  psi_1 <- psi_1 / pmax(cnt1, 1)
-  psi_0 <- psi_0 / pmax(cnt0, 1)
-  
-  # Estimate psi_i(0,...,0) under the fitted graph
-  psi_00 <- numeric(N)
-  for (g in 1:n_groups) {
-    EY0        <- gibbs_intervene_group_s2(rep(0, 4), params, params_L, network_fit,
-                                           n_iter_intervene, burn_in_intervene)
-    idx_global <- ((g - 1) * 4 + 1):(g * 4)
-    psi_00[idx_global] <- EY0
-  }
-  
-  DE  <- mean(psi_1 - psi_0)
-  IE  <- mean(psi_0 - psi_00)
-  ATE <- mean(psi_1 - psi_00)
-  return(list(DE = DE, IE = IE, ATE = ATE))
+
+  r_a <- estimate_one_fit(G_int_a, G_dep_a)
+  r_b <- estimate_one_fit(G_int_b, G_dep_b)
+  r_c <- estimate_one_fit(G_int_c, G_dep_c)
+
+  c(DE_a = unname(r_a["DE"]), IE_a = unname(r_a["IE"]), ATE_a = unname(r_a["ATE"]),
+    DE_b = unname(r_b["DE"]), IE_b = unname(r_b["IE"]), ATE_b = unname(r_b["ATE"]),
+    DE_c = unname(r_c["DE"]), IE_c = unname(r_c["IE"]), ATE_c = unname(r_c["ATE"]))
 }
 
-# -----------------------------------------------------------------------------
-# Main parallel simulation — Setting 2
-# -----------------------------------------------------------------------------
 
-run_simulation_setting2_parallel <- function(
+# -----------------------------------------------------------------------------
+# 8. Main parallel driver
+# -----------------------------------------------------------------------------
+# Orchestrates the full simulation:
+#   - Computes analytical truth under the TRUE graph (c).
+#   - Runs n_sim paired replicates in parallel via foreach + doParallel.
+#   - Summarizes bias, empirical SE, RMSE, and 95% coverage for each fit.
+# -----------------------------------------------------------------------------
+run_simulation_setting2 <- function(
     n_sim    = 500,
-    n_groups = 5,
-    params   = list(beta0=-1, beta1=0.5, beta2=0.3, beta3=0.4, beta4=0.2, theta=0.3),
-    params_A = list(gamma0=0, gamma1=0.3, gamma2=0.2, psi=0.4),
-    params_L = list(alpha=-0.5, omega=0.4),
-    n_alloc           = 50,
-    n_iter_intervene  = 5000,
-    burn_in_intervene = 1000,
+    N        = 8,
+    params   = list(beta0 = -1, beta1 = 0.5, beta2 = 0.3,
+                    beta3 = 0.4, beta4 = 0.2, theta = 0.3),
+    params_A = list(gamma0 = 0, gamma1 = 0.3, gamma2 = 0.2, psi = 0.4),
+    params_L = list(alpha = -0.5, omega = 0.4),
+    n_iter   = 5000,
+    burn_in  = 1000,
+    n_alloc  = 50,
     n_cores  = NULL,
     verbose  = TRUE,
     seed     = 42) {
-  
+
   if (is.null(n_cores)) n_cores <- max(1, detectCores() - 1)
-  
-  net_a <- create_group_network_a_s2()
-  net_b <- create_group_network_b_s2()
-  net_c <- create_group_network_c_s2()
-  
+
+  # --- Graph specifications ---------------------------------------------------
+  # True DGP = graph (c): interference = pairs, dependence = chain
+  G_int_true <- pairs_local(); G_dep_true <- chain_local()
+  # Three fitted graphs
+  G_int_a <- chain_local(); G_dep_a <- chain_local()   # fit (a): both chain
+  G_int_b <- pairs_local(); G_dep_b <- pairs_local()   # fit (b): both pairs
+  G_int_c <- pairs_local(); G_dep_c <- chain_local()   # fit (c): correct
+
+  network <- create_network_c(N)
+
   if (verbose) {
-    cat("==============================================\n")
-    cat("SETTING 2: NETWORK MISSPECIFICATION STUDY\n")
-    cat("True DGP: Graph (c) | Fitted: (a), (b), (c)\n")
+    cat("===============================================\n")
+    cat("SETTING 2: Misspecification under DGP (c)\n")
+    cat("N =", N, "(", network$n_groups, "groups of 4 )\n")
     cat("n_sim =", n_sim, "| n_cores =", n_cores, "\n")
-    cat("==============================================\n\n")
+    cat("Fits: (a) chain for both\n")
+    cat("      (b) pairs for both\n")
+    cat("      (c) pairs interference, chain dependence [TRUE]\n")
+    cat("===============================================\n\n")
   }
-  
-  if (verbose) cat("Calculating analytical truth...\n")
-  truth <- calculate_true_estimands_s2(params, params_A, params_L)
+
+  # --- Analytical truth -------------------------------------------------------
+  if (verbose) cat("Calculating analytical truth under graph (c)...\n")
+  truth <- calculate_estimands_analytical(network, params, params_A, params_L,
+                                          G_int_true, G_dep_true)
   if (verbose) {
-    cat("True DE:", round(truth$DE, 4),
+    cat("\nTrue DE:",  round(truth$DE, 4),
         "| True IE:", round(truth$IE, 4),
         "| True ATE:", round(truth$ATE, 4), "\n\n")
   }
-  
-  # Functions to export to parallel workers
-  fns_to_export <- c(
-    "create_group_network_a_s2", "create_group_network_b_s2",
-    "create_group_network_c_s2", "generate_binary_configs",
-    "calculate_energy_L_s2", "calculate_energy_A_s2", "calculate_energy_Y_s2",
-    "gibbs_obs_group_c_s2", "gibbs_intervene_group_s2",
-    "run_single_replicate_s2"
-  )
-  
-  # Capture all variables needed by workers into a named list so they are
-  # explicitly visible inside foreach regardless of R's scoping rules.
-  worker_env <- list(
-    params            = params,
-    params_A          = params_A,
-    params_L          = params_L,
-    n_groups          = n_groups,
-    n_alloc           = n_alloc,
-    n_iter_intervene  = n_iter_intervene,
-    burn_in_intervene = burn_in_intervene,
-    seed              = seed
-  )
-  
-  # Run each fitted graph in parallel
-  run_parallel_for_graph <- function(network_fit, graph_label) {
-    if (verbose) cat("Running graph", graph_label, "in parallel...\n")
-    cl <- makeCluster(n_cores); registerDoParallel(cl)
-    clusterExport(cl, fns_to_export, envir = environment())
-    clusterExport(cl, c("worker_env", "network_fit"), envir = environment())
-    t0 <- Sys.time()
-    res <- foreach(sim = 1:n_sim, .combine = rbind) %dopar% {
-      r <- run_single_replicate_s2(
-        sim_id            = sim,
-        network_fit       = network_fit,
-        params            = worker_env$params,
-        params_A          = worker_env$params_A,
-        params_L          = worker_env$params_L,
-        n_groups          = worker_env$n_groups,
-        n_alloc           = worker_env$n_alloc,
-        n_iter_intervene  = worker_env$n_iter_intervene,
-        burn_in_intervene = worker_env$burn_in_intervene,
-        seed              = worker_env$seed)
-      c(DE = r$DE, IE = r$IE, ATE = r$ATE)
-    }
-    stopCluster(cl)
-    elapsed <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 2)
-    if (verbose) cat("  Graph", graph_label, "done in", elapsed, "minutes\n")
-    res
+
+  # --- Parallel backend -------------------------------------------------------
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  clusterExport(cl, c(
+    "build_network", "chain_local", "pairs_local",
+    "create_network_a", "create_network_b", "create_network_c",
+    "generate_binary_configs", "deg_local",
+    "group_energy_Y", "group_energy_A", "group_energy_L",
+    "prob_Y_given_rest", "prob_A_given_rest", "prob_L_given_rest",
+    "gibbs_sampler_observational", "gibbs_sampler_interventional",
+    "run_single_replicate"
+  ), envir = environment())
+
+  # --- Monte Carlo loop -------------------------------------------------------
+  if (verbose) cat("Running", n_sim, "paired replicates in parallel...\n")
+  t0 <- Sys.time()
+  res <- foreach(sim = 1:n_sim, .combine = rbind) %dopar% {
+    run_single_replicate(
+      sim_id = sim,
+      network = network, N = N,
+      G_int_true = G_int_true, G_dep_true = G_dep_true,
+      G_int_a = G_int_a, G_dep_a = G_dep_a,
+      G_int_b = G_int_b, G_dep_b = G_dep_b,
+      G_int_c = G_int_c, G_dep_c = G_dep_c,
+      params = params, params_A = params_A, params_L = params_L,
+      n_iter = n_iter, burn_in = burn_in, n_alloc = n_alloc,
+      seed = seed
+    )
   }
-  
-  res_a <- run_parallel_for_graph(net_a, "(a)")
-  res_b <- run_parallel_for_graph(net_b, "(b)")
-  res_c <- run_parallel_for_graph(net_c, "(c)")
-  
-  # Coverage: fraction of estimates within 1.96 SDs of the true value
-  coverage <- function(est, tv) mean(abs(est - tv) <= 1.96 * sd(est))
-  
-  # Build summary table
-  make_rows <- function(res_mat, model_label) {
-    do.call(rbind, lapply(c("DE", "IE", "ATE"), function(nm) {
-      tv  <- truth[[nm]]
-      est <- res_mat[, nm]
-      data.frame(
-        model    = model_label,
-        estimand = nm,
-        truth    = round(tv, 4),
-        mean     = round(mean(est), 4),
-        bias     = round(mean(est) - tv, 4),
-        se       = round(sd(est), 4),
-        rmse     = round(sqrt(mean((est - tv)^2)), 4),
-        coverage = round(coverage(est, tv) * 100, 1),
-        stringsAsFactors = FALSE
-      )
-    }))
+  stopCluster(cl)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+  if (verbose) cat("Completed in", round(elapsed, 2), "minutes\n\n")
+
+  colnames(res) <- c("DE_a", "IE_a", "ATE_a",
+                     "DE_b", "IE_b", "ATE_b",
+                     "DE_c", "IE_c", "ATE_c")
+
+  # --- Summarization ----------------------------------------------------------
+  # 95% coverage based on a single across-replicate SD (Setting-1 convention).
+  coverage <- function(est, truth_val)
+    mean(abs(est - truth_val) <= 1.96 * sd(est))
+
+  summarize_fit <- function(label, suffix) {
+    DE  <- res[, paste0("DE_",  suffix)]
+    IE  <- res[, paste0("IE_",  suffix)]
+    ATE <- res[, paste0("ATE_", suffix)]
+    rbind(
+      data.frame(fit = label, estimand = "DE",
+                 truth    = round(truth$DE, 4),
+                 mean     = round(mean(DE), 4),
+                 bias     = round(mean(DE) - truth$DE, 4),
+                 emp_se   = round(sd(DE), 4),
+                 rmse     = round(sqrt(mean((DE - truth$DE)^2)), 4),
+                 coverage = round(100 * coverage(DE, truth$DE), 1)),
+      data.frame(fit = label, estimand = "IE",
+                 truth    = round(truth$IE, 4),
+                 mean     = round(mean(IE), 4),
+                 bias     = round(mean(IE) - truth$IE, 4),
+                 emp_se   = round(sd(IE), 4),
+                 rmse     = round(sqrt(mean((IE - truth$IE)^2)), 4),
+                 coverage = round(100 * coverage(IE, truth$IE), 1)),
+      data.frame(fit = label, estimand = "ATE",
+                 truth    = round(truth$ATE, 4),
+                 mean     = round(mean(ATE), 4),
+                 bias     = round(mean(ATE) - truth$ATE, 4),
+                 emp_se   = round(sd(ATE), 4),
+                 rmse     = round(sqrt(mean((ATE - truth$ATE)^2)), 4),
+                 coverage = round(100 * coverage(ATE, truth$ATE), 1))
+    )
   }
-  
+
   summary_table <- rbind(
-    make_rows(res_a, "Graph (a)"),
-    make_rows(res_b, "Graph (b)"),
-    make_rows(res_c, "Graph (c)")
+    summarize_fit("Fit (a)", "a"),
+    summarize_fit("Fit (b)", "b"),
+    summarize_fit("Fit (c)", "c")
   )
-  
+
   if (verbose) {
-    cat("\n==============================================\n")
-    cat("RESULTS — SETTING 2\n")
-    cat("==============================================\n")
+    cat("===============================================\n")
+    cat("RESULTS - SETTING 2\n")
+    cat("===============================================\n")
     print(summary_table, row.names = FALSE)
+    cat("\nElapsed:", round(elapsed, 2), "minutes on", n_cores, "cores\n")
   }
-  
-  list(
-    truth         = truth,
-    raw_a         = res_a,
-    raw_b         = res_b,
-    raw_c         = res_c,
-    summary       = summary_table
-  )
+
+  list(truth        = truth,
+       raw          = res,
+       summary      = summary_table,
+       elapsed_mins = elapsed,
+       n_cores      = n_cores)
 }
 
+
 # =============================================================================
-# RUN SETTING 2
+# 9. Entry point
+# =============================================================================
+# Edit parameter lists below to reproduce / modify the reported run.
 # =============================================================================
 
-# Same parameters as Setting 1
-params   <- list(beta0=-1, beta1=0.5, beta2=0.3, beta3=1.2, beta4=0.8, theta=0.6)
-params_A <- list(gamma0=0, gamma1=0.3, gamma2=0.8, psi=0.7)
-params_L <- list(alpha=-0.5, omega=0.6)
+if (sys.nframe() == 0) {
 
-results_s2 <- run_simulation_setting2_parallel(
-  n_sim             = 500,
-  n_groups          = 5,
-  params            = params,
-  params_A          = params_A,
-  params_L          = params_L,
-  n_alloc           = 50,
-  n_iter_intervene  = 5000,
-  burn_in_intervene = 1000,
-  n_cores           = NULL,
-  verbose           = TRUE,
-  seed              = 42
-)
+  params   <- list(beta0 = -1, beta1 = 0.5, beta2 = 0.3,
+                   beta3 = 1.2, beta4 = 0.8, theta = 0.6)
+  params_A <- list(gamma0 = 0, gamma1 = 0.3, gamma2 = 0.2, psi = 0.7)
+  params_L <- list(alpha = -0.5, omega = 0.6)
+
+  cat("Detected", detectCores(), "CPU cores\n\n")
+
+  results_s2 <- run_simulation_setting2(
+    n_sim    = 500,
+    N        = 8,          # increase (e.g., to 20) for larger networks
+    params   = params,
+    params_A = params_A,
+    params_L = params_L,
+    n_iter   = 5000,
+    burn_in  = 1500,
+    n_alloc  = 50,
+    n_cores  = NULL,
+    verbose  = TRUE,
+    seed     = 42
+  )
+}
